@@ -211,6 +211,22 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
             </div>
 
             <div class="results-block">
+              <p class="panel-label">Zones precises</p>
+              <div id="ocr-zones" class="zone-grid">
+                <article class="zone-card zone-empty">
+                  <p class="empty-item">Les zones OCR apparaitront ici.</p>
+                </article>
+              </div>
+            </div>
+
+            <div class="results-block">
+              <p class="panel-label">Candidats numero</p>
+              <ul id="ocr-collector-candidates" class="candidate-list">
+                <li class="empty-item">Les candidats de numero apparaitront ici.</li>
+              </ul>
+            </div>
+
+            <div class="results-block">
               <p class="panel-label">Texte brut</p>
               <pre id="ocr-raw-text" class="raw-text">Aucune lecture lancee.</pre>
             </div>
@@ -250,6 +266,10 @@ const ocrSnapshot = getRequiredElement<HTMLImageElement>('#ocr-snapshot');
 const ocrSnapshotEmpty = getRequiredElement<HTMLDivElement>('#ocr-snapshot-empty');
 const ocrConfidence = getRequiredElement<HTMLSpanElement>('#ocr-confidence');
 const ocrSignals = getRequiredElement<HTMLUListElement>('#ocr-signals');
+const ocrZones = getRequiredElement<HTMLDivElement>('#ocr-zones');
+const ocrCollectorCandidates = getRequiredElement<HTMLUListElement>(
+  '#ocr-collector-candidates',
+);
 const ocrRawText = getRequiredElement<HTMLElement>('#ocr-raw-text');
 const ocrLines = getRequiredElement<HTMLUListElement>('#ocr-lines');
 const ocrWords = getRequiredElement<HTMLDivElement>('#ocr-words');
@@ -365,6 +385,13 @@ function renderOcrState(): void {
     ocrConfidence.textContent = 'Confiance 0%';
     ocrSignals.innerHTML =
       '<li class="empty-item">Aucune information OCR pour le moment.</li>';
+    ocrZones.innerHTML = `
+      <article class="zone-card zone-empty">
+        <p class="empty-item">Les zones OCR apparaitront ici.</p>
+      </article>
+    `;
+    ocrCollectorCandidates.innerHTML =
+      '<li class="empty-item">Les candidats de numero apparaitront ici.</li>';
     ocrRawText.textContent = 'Aucune lecture lancee.';
     ocrLines.innerHTML =
       '<li class="empty-item">Les lignes OCR apparaitront ici.</li>';
@@ -389,6 +416,45 @@ function renderOcrState(): void {
           )
           .join('')
       : '<li class="empty-item">Aucun signal clair n a ete repere dans cette lecture.</li>';
+  ocrZones.innerHTML =
+    result.zones.length > 0
+      ? result.zones
+          .map(
+            (zone) => `
+              <article class="zone-card">
+                <div class="zone-head">
+                  <span class="zone-title">${escapeHtml(zone.label)}</span>
+                  <span class="zone-confidence">${Math.round(zone.confidence)}%</span>
+                </div>
+                ${
+                  zone.debugImageUrl
+                    ? `<img class="zone-image" src="${zone.debugImageUrl}" alt="Zone ${escapeHtml(zone.label)}" />`
+                    : `<div class="zone-image zone-image-empty">Pas d image</div>`
+                }
+                <p class="zone-debug">${escapeHtml(zone.debugLabel || 'zone OCR')}</p>
+                <p class="zone-text">${escapeHtml(zone.text || 'Aucune lecture exploitable')}</p>
+              </article>
+            `,
+          )
+          .join('')
+      : `
+        <article class="zone-card zone-empty">
+          <p class="empty-item">Les zones OCR apparaitront ici.</p>
+        </article>
+      `;
+  ocrCollectorCandidates.innerHTML =
+    result.collectorNumberCandidates.length > 0
+      ? result.collectorNumberCandidates
+          .map(
+            (candidate) => `
+              <li class="candidate-item">
+                <strong>${escapeHtml(candidate.value)}</strong>
+                <span class="candidate-meta">${Math.round(candidate.confidence)}% · ${escapeHtml(candidate.source)}</span>
+              </li>
+            `,
+          )
+          .join('')
+      : '<li class="empty-item">Aucun candidat solide pour le numero de carte.</li>';
   ocrRawText.textContent = result.rawText || 'Aucun texte brut n a ete remonte.';
   ocrLines.innerHTML =
     result.lines.length > 0

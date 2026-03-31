@@ -34,6 +34,7 @@ Le projet publie les assets avec la base `/open_scan_pokemon/` pour GitHub Pages
 - lecture OCR du cadre courant avec Tesseract.js
 - choix de la langue de carte pour piloter le modele OCR
 - passe OCR dediee au numero de carte sur la bande basse
+- lecture OCR par zones precises pour le nom, le HP/PV et la bande basse
 - affichage du texte brut, des lignes detectees et des mots reconnus
 - etats clairs pour permission, indisponibilite et erreur
 
