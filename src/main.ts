@@ -603,12 +603,12 @@ async function scanCurrentFrame(): Promise<void> {
     const result = await recognizeCanvas(canvas);
 
     state.lastOcrResult = result;
-    state.ocrSnapshotUrl = snapshotUrl;
+    state.ocrSnapshotUrl = result.debugImageUrl || snapshotUrl;
     state.ocrProgress = 100;
     setOcrStatus(
       'done',
       result.rawText
-        ? `Lecture terminee: ${result.lines.length} ligne(s) et ${result.words.length} mot(s) detectes.`
+        ? `Lecture terminee via ${result.debugLabel}: ${result.lines.length} ligne(s) et ${result.words.length} mot(s) detectes.`
         : 'Lecture terminee mais aucun texte exploitable n a ete remonte.',
       100,
     );
@@ -633,10 +633,11 @@ function captureVideoFrame(video: HTMLVideoElement): HTMLCanvasElement | null {
     return null;
   }
 
-  const longestEdge = Math.max(width, height);
+  const cropBounds = getScanCropBounds(width, height);
+  const longestEdge = Math.max(cropBounds.width, cropBounds.height);
   const scale = longestEdge > 1600 ? 1600 / longestEdge : 1;
-  const targetWidth = Math.max(1, Math.round(width * scale));
-  const targetHeight = Math.max(1, Math.round(height * scale));
+  const targetWidth = Math.max(1, Math.round(cropBounds.width * scale));
+  const targetHeight = Math.max(1, Math.round(cropBounds.height * scale));
   const canvas = document.createElement('canvas');
   const context = canvas.getContext('2d');
 
@@ -646,9 +647,44 @@ function captureVideoFrame(video: HTMLVideoElement): HTMLCanvasElement | null {
 
   canvas.width = targetWidth;
   canvas.height = targetHeight;
-  context.drawImage(video, 0, 0, targetWidth, targetHeight);
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = 'high';
+  context.drawImage(
+    video,
+    cropBounds.left,
+    cropBounds.top,
+    cropBounds.width,
+    cropBounds.height,
+    0,
+    0,
+    targetWidth,
+    targetHeight,
+  );
 
   return canvas;
+}
+
+function getScanCropBounds(
+  width: number,
+  height: number,
+): { height: number; left: number; top: number; width: number } {
+  const ratio = 5 / 7;
+  const maxWidth = width * 0.9;
+  const maxHeight = height * 0.9;
+  let cropWidth = maxWidth;
+  let cropHeight = cropWidth / ratio;
+
+  if (cropHeight > maxHeight) {
+    cropHeight = maxHeight;
+    cropWidth = cropHeight * ratio;
+  }
+
+  return {
+    height: cropHeight,
+    left: (width - cropWidth) / 2,
+    top: (height - cropHeight) / 2,
+    width: cropWidth,
+  };
 }
 
 function translateOcrProgress(status: string): string {
