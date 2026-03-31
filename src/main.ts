@@ -14,6 +14,7 @@ import {
   storePreferredCameraId,
 } from './camera';
 import {
+  type CardLanguage,
   type OcrResultSummary,
   type OcrStatus,
   recognizeCanvas,
@@ -26,14 +27,15 @@ type AppState = {
   activeDeviceId: string;
   currentStream: MediaStream | null;
   devices: CameraDevice[];
-  hasAttemptedOcrWarmup: boolean;
   isBusy: boolean;
   lastOcrResult: OcrResultSummary | null;
   ocrBusy: boolean;
+  ocrLanguageReady: CardLanguage | null;
   ocrMessage: string;
   ocrProgress: number;
   ocrSnapshotUrl: string;
   ocrStatus: OcrStatus;
+  selectedCardLanguage: CardLanguage;
   status: CameraStatus;
 };
 
@@ -65,6 +67,13 @@ const ocrStatusLabels: Record<OcrStatus, string> = {
   ready: 'OCR pret',
   scanning: 'Lecture OCR',
 };
+
+const cardLanguageStorageKey = 'preferredCardLanguage';
+const cardLanguageOptions: Array<{ label: string; value: CardLanguage }> = [
+  { label: 'Francais', value: 'fra' },
+  { label: 'Anglais', value: 'eng' },
+  { label: 'Mixte FR + EN', value: 'eng+fra' },
+];
 
 document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
   <div class="app-shell">
@@ -127,6 +136,20 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
           <div class="select-shell">
             <select id="camera-select" name="camera-select" disabled>
               <option>Detection en cours...</option>
+            </select>
+          </div>
+        </label>
+
+        <label class="field" for="language-select">
+          <span>Langue de la carte</span>
+          <div class="select-shell">
+            <select id="language-select" name="language-select">
+              ${cardLanguageOptions
+                .map(
+                  (option) =>
+                    `<option value="${option.value}">${option.label}</option>`,
+                )
+                .join('')}
             </select>
           </div>
         </label>
@@ -217,6 +240,7 @@ const videoShell = getRequiredElement<HTMLDivElement>('#video-shell');
 const cameraState = getRequiredElement<HTMLSpanElement>('#camera-state');
 const cameraMessage = getRequiredElement<HTMLParagraphElement>('#camera-message');
 const cameraSelect = getRequiredElement<HTMLSelectElement>('#camera-select');
+const languageSelect = getRequiredElement<HTMLSelectElement>('#language-select');
 const cameraRefresh = getRequiredElement<HTMLButtonElement>('#camera-refresh');
 const ocrScanButton = getRequiredElement<HTMLButtonElement>('#ocr-scan');
 const ocrStateLabel = getRequiredElement<HTMLSpanElement>('#ocr-state');
@@ -234,17 +258,20 @@ const state: AppState = {
   activeDeviceId: '',
   currentStream: null,
   devices: [],
-  hasAttemptedOcrWarmup: false,
   isBusy: false,
   lastOcrResult: null,
   ocrBusy: false,
+  ocrLanguageReady: null,
   ocrMessage:
     'Charge le modele OCR puis analyse le cadre pour afficher toutes les lignes detectees.',
   ocrProgress: 0,
   ocrSnapshotUrl: '',
   ocrStatus: 'idle',
+  selectedCardLanguage: getStoredCardLanguage(),
   status: 'idle',
 };
+
+languageSelect.value = state.selectedCardLanguage;
 
 setOcrProgressListener((message) => {
   state.ocrProgress = Math.max(0, Math.min(100, Math.round(message.progress * 100)));
@@ -277,6 +304,7 @@ function setStreamPresence(hasStream: boolean): void {
 function syncControls(): void {
   cameraRefresh.disabled = state.isBusy;
   cameraSelect.disabled = state.isBusy || state.devices.length === 0;
+  languageSelect.disabled = state.ocrBusy;
   ocrScanButton.disabled = state.ocrBusy || state.status !== 'ready';
   cameraRefresh.textContent = state.isBusy
     ? 'Ouverture en cours...'
@@ -401,6 +429,39 @@ function setOcrStatus(status: OcrStatus, message: string, progress?: number): vo
   renderOcrState();
 }
 
+function getStoredCardLanguage(): CardLanguage {
+  try {
+    const storedValue = window.localStorage.getItem(cardLanguageStorageKey);
+
+    if (
+      storedValue === 'fra' ||
+      storedValue === 'eng' ||
+      storedValue === 'eng+fra'
+    ) {
+      return storedValue;
+    }
+  } catch {
+    // Ignore local storage failures and fall back to French.
+  }
+
+  return 'fra';
+}
+
+function storeCardLanguage(language: CardLanguage): void {
+  try {
+    window.localStorage.setItem(cardLanguageStorageKey, language);
+  } catch {
+    // Ignore local storage failures and keep the UI working.
+  }
+}
+
+function getCardLanguageLabel(language: CardLanguage): string {
+  return (
+    cardLanguageOptions.find((option) => option.value === language)?.label ??
+    'Francais'
+  );
+}
+
 function resolveActiveDeviceId(
   stream: MediaStream | null,
   devices: CameraDevice[],
@@ -460,26 +521,26 @@ function watchTrackEnd(stream: MediaStream): void {
 }
 
 async function maybeWarmupOcr(): Promise<void> {
-  if (state.hasAttemptedOcrWarmup) {
+  if (state.ocrLanguageReady === state.selectedCardLanguage) {
     return;
   }
 
-  state.hasAttemptedOcrWarmup = true;
   setOcrStatus(
     'loading',
-    'Chargement du modele OCR en tache de fond. La premiere lecture peut prendre un peu de temps.',
+    `Chargement du modele OCR ${getCardLanguageLabel(state.selectedCardLanguage).toLowerCase()}. La premiere lecture peut prendre un peu de temps.`,
     0,
   );
 
   try {
-    await warmupOcr();
+    await warmupOcr(state.selectedCardLanguage);
+    state.ocrLanguageReady = state.selectedCardLanguage;
     setOcrStatus(
       'ready',
-      'Modele OCR pret. Lance une lecture du cadre pour afficher tout le texte detecte.',
+      `Modele OCR ${getCardLanguageLabel(state.selectedCardLanguage).toLowerCase()} pret. Lance une lecture du cadre pour afficher tout le texte detecte.`,
       100,
     );
   } catch {
-    state.hasAttemptedOcrWarmup = false;
+    state.ocrLanguageReady = null;
     setOcrStatus(
       'error',
       'Le modele OCR n a pas pu etre charge. Verifie le reseau puis reessaie.',
@@ -586,7 +647,7 @@ async function scanCurrentFrame(): Promise<void> {
   state.ocrBusy = true;
   state.ocrProgress = 0;
   setOcrStatus(
-    state.hasAttemptedOcrWarmup ? 'scanning' : 'loading',
+    state.ocrLanguageReady === state.selectedCardLanguage ? 'scanning' : 'loading',
     'Preparation de la capture OCR.',
     0,
   );
@@ -600,7 +661,7 @@ async function scanCurrentFrame(): Promise<void> {
     renderOcrState();
 
     const snapshotUrl = canvas.toDataURL('image/jpeg', 0.92);
-    const result = await recognizeCanvas(canvas);
+    const result = await recognizeCanvas(canvas, state.selectedCardLanguage);
 
     state.lastOcrResult = result;
     state.ocrSnapshotUrl = result.debugImageUrl || snapshotUrl;
@@ -608,7 +669,7 @@ async function scanCurrentFrame(): Promise<void> {
     setOcrStatus(
       'done',
       result.rawText
-        ? `Lecture terminee via ${result.debugLabel}: ${result.lines.length} ligne(s) et ${result.words.length} mot(s) detectes.`
+        ? `Lecture terminee via ${result.debugLabel}: ${result.lines.length} ligne(s), ${result.words.length} mot(s) et numero ${result.collectorNumber || 'non verrouille'}.`
         : 'Lecture terminee mais aucun texte exploitable n a ete remonte.',
       100,
     );
@@ -731,6 +792,29 @@ cameraSelect.addEventListener('change', () => {
 cameraRefresh.addEventListener('click', () => {
   const nextDeviceId = cameraSelect.value || state.activeDeviceId || undefined;
   void startCamera(nextDeviceId);
+});
+
+languageSelect.addEventListener('change', () => {
+  const nextLanguage = languageSelect.value as CardLanguage;
+
+  if (nextLanguage === state.selectedCardLanguage) {
+    return;
+  }
+
+  state.selectedCardLanguage = nextLanguage;
+  state.ocrLanguageReady = null;
+  state.lastOcrResult = null;
+  state.ocrSnapshotUrl = '';
+  storeCardLanguage(nextLanguage);
+  setOcrStatus(
+    'idle',
+    `Langue de carte reglee sur ${getCardLanguageLabel(nextLanguage)}. Relance une lecture pour utiliser ce modele.`,
+    0,
+  );
+
+  if (state.status === 'ready') {
+    void maybeWarmupOcr();
+  }
 });
 
 ocrScanButton.addEventListener('click', () => {

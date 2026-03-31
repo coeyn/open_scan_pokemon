@@ -1,5 +1,6 @@
 import * as Tesseract from 'tesseract.js';
 
+export type CardLanguage = 'eng' | 'eng+fra' | 'fra';
 export type OcrStatus = 'idle' | 'loading' | 'ready' | 'scanning' | 'done' | 'error';
 
 export interface OcrSignal {
@@ -18,8 +19,16 @@ export interface OcrWordResult {
   text: string;
 }
 
+export interface OcrCollectorCandidate {
+  confidence: number;
+  source: string;
+  value: string;
+}
+
 export interface OcrResultSummary {
   averageConfidence: number;
+  collectorNumber: string;
+  collectorNumberCandidates: OcrCollectorCandidate[];
   debugImageUrl: string;
   debugLabel: string;
   lines: OcrLineResult[];
@@ -30,13 +39,7 @@ export interface OcrResultSummary {
 
 type ProgressListener = (message: Tesseract.LoggerMessage) => void;
 
-const OCR_LANGS = 'eng+fra';
-const progressMatchers = [
-  {
-    label: 'Numero probable',
-    pattern:
-      /\b(?:[A-Z]{0,4}\d{1,3}\/[A-Z0-9]{1,4}|[A-Z]{0,4}\d{1,3}|[A-Z]{1,3}\d{1,3}\/[A-Z0-9]{1,4}|\d{1,3}\/\d{1,3})\b/i,
-  },
+const genericSignalMatchers = [
   {
     label: 'HP / PV',
     pattern: /\b(?:HP|PV)\s*\d{2,4}\b|\b\d{2,4}\s*(?:HP|PV)\b/i,
@@ -48,36 +51,61 @@ const progressMatchers = [
   },
 ];
 
+const generalWorkerParams: Partial<Tesseract.WorkerParams> = {
+  preserve_interword_spaces: '1',
+  tessedit_pageseg_mode: Tesseract.PSM.SPARSE_TEXT,
+  user_defined_dpi: '300',
+};
+
+const numberWorkerParams: Partial<Tesseract.WorkerParams> = {
+  preserve_interword_spaces: '0',
+  tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/-.',
+  tessedit_pageseg_mode: Tesseract.PSM.SINGLE_LINE,
+  user_defined_dpi: '300',
+};
+
 let activeProgressListener: ProgressListener = () => undefined;
 let workerPromise: Promise<Tesseract.Worker> | null = null;
+let currentWorkerLanguage: CardLanguage | null = null;
 
 interface PreparedCanvas {
   canvas: HTMLCanvasElement;
   label: string;
 }
 
+interface CollectorRegion {
+  height: number;
+  label: string;
+  left: number;
+  top: number;
+  width: number;
+}
+
 export function setOcrProgressListener(listener: ProgressListener): void {
   activeProgressListener = listener;
 }
 
-export async function warmupOcr(): Promise<void> {
-  await getWorker();
+export async function warmupOcr(language: CardLanguage): Promise<void> {
+  await getWorker(language);
 }
 
 export async function terminateOcrWorker(): Promise<void> {
   if (!workerPromise) {
+    currentWorkerLanguage = null;
     return;
   }
 
   const worker = await workerPromise;
   workerPromise = null;
+  currentWorkerLanguage = null;
   await worker.terminate();
 }
 
 export async function recognizeCanvas(
   source: HTMLCanvasElement,
+  language: CardLanguage,
 ): Promise<OcrResultSummary> {
-  const worker = await getWorker();
+  const worker = await getWorker(language);
   const primary = prepareEnhancedCanvas(source);
   let best = await runRecognition(worker, primary);
 
@@ -89,31 +117,48 @@ export async function recognizeCanvas(
     }
   }
 
+  const collectorNumberCandidates = await detectCollectorNumber(worker, source);
+  const collectorNumber = collectorNumberCandidates[0]?.value ?? '';
+
   return {
     ...best.summary,
+    collectorNumber,
+    collectorNumberCandidates,
     debugImageUrl: best.prepared.canvas.toDataURL('image/jpeg', 0.92),
     debugLabel: best.prepared.label,
+    signals: detectSignals(best.summary.lines, collectorNumberCandidates),
   };
 }
 
-function getWorker(): Promise<Tesseract.Worker> {
-  if (!workerPromise) {
-    workerPromise = Tesseract.createWorker(
-      OCR_LANGS,
-      Tesseract.OEM.LSTM_ONLY,
-      {
-        logger: (message) => activeProgressListener(message),
-      },
-    ).then(async (worker) => {
-      await worker.setParameters({
-        preserve_interword_spaces: '1',
-        tessedit_pageseg_mode: Tesseract.PSM.SPARSE_TEXT,
-        user_defined_dpi: '300',
-      });
+function getWorker(language: CardLanguage): Promise<Tesseract.Worker> {
+  return ensureWorker(language);
+}
 
-      return worker;
-    });
+function createWorker(language: CardLanguage): Promise<Tesseract.Worker> {
+  return Tesseract.createWorker(language, Tesseract.OEM.LSTM_ONLY, {
+    logger: (message) => activeProgressListener(message),
+  }).then(async (worker) => {
+    await worker.setParameters(generalWorkerParams);
+
+    return worker;
+  });
+}
+
+async function ensureWorker(language: CardLanguage): Promise<Tesseract.Worker> {
+  if (workerPromise && currentWorkerLanguage === language) {
+    return workerPromise;
   }
+
+  if (workerPromise) {
+    const previousWorker = await workerPromise;
+
+    workerPromise = null;
+    currentWorkerLanguage = null;
+    await previousWorker.terminate();
+  }
+
+  workerPromise = createWorker(language);
+  currentWorkerLanguage = language;
 
   return workerPromise;
 }
@@ -156,11 +201,24 @@ function collectWords(lines: OcrLineResult[]): OcrWordResult[] {
     .filter((word) => word.text.length > 0);
 }
 
-function detectSignals(lines: OcrLineResult[]): OcrSignal[] {
+function detectSignals(
+  lines: OcrLineResult[],
+  collectorNumberCandidates: OcrCollectorCandidate[],
+): OcrSignal[] {
   const signals: OcrSignal[] = [];
   const usedValues = new Set<string>();
+  const collectorNumber = collectorNumberCandidates[0];
 
-  progressMatchers.forEach((matcher) => {
+  if (collectorNumber) {
+    usedValues.add(collectorNumber.value);
+    signals.push({
+      confidence: collectorNumber.confidence,
+      label: 'Numero probable',
+      value: collectorNumber.value,
+    });
+  }
+
+  genericSignalMatchers.forEach((matcher) => {
     const match = lines.find((line) => matcher.pattern.test(line.text));
 
     if (!match) {
@@ -184,7 +242,7 @@ function detectSignals(lines: OcrLineResult[]): OcrSignal[] {
   const probableName = lines.find(
     (line) =>
       line.text.length >= 4 &&
-      !progressMatchers.some((matcher) => matcher.pattern.test(line.text)),
+      !genericSignalMatchers.some((matcher) => matcher.pattern.test(line.text)),
   );
 
   if (probableName && !usedValues.has(probableName.text)) {
@@ -206,6 +264,8 @@ async function runRecognition(
   worker: Tesseract.Worker,
   prepared: PreparedCanvas,
 ): Promise<{ prepared: PreparedCanvas; summary: OcrResultSummary }> {
+  await worker.setParameters(generalWorkerParams);
+
   const { data } = await worker.recognize(
     prepared.canvas,
     { rotateAuto: true },
@@ -228,11 +288,13 @@ async function runRecognition(
     prepared,
     summary: {
       averageConfidence,
+      collectorNumber: '',
+      collectorNumberCandidates: [],
       debugImageUrl: '',
       debugLabel: prepared.label,
       lines,
       rawText,
-      signals: detectSignals(lines),
+      signals: [],
       words,
     },
   };
@@ -250,9 +312,58 @@ function scoreSummary(summary: OcrResultSummary): number {
   return (
     summary.averageConfidence +
     summary.lines.length * 6 +
-    summary.signals.length * 14 +
     Math.min(summary.words.length, 40) * 0.75
   );
+}
+
+async function detectCollectorNumber(
+  worker: Tesseract.Worker,
+  source: HTMLCanvasElement,
+): Promise<OcrCollectorCandidate[]> {
+  const candidates = new Map<string, OcrCollectorCandidate>();
+  const regions: CollectorRegion[] = [
+    { label: 'bas gauche large', left: 0.02, top: 0.81, width: 0.54, height: 0.18 },
+    { label: 'bas gauche serre', left: 0.02, top: 0.86, width: 0.4, height: 0.1 },
+    { label: 'bande basse', left: 0.02, top: 0.81, width: 0.78, height: 0.18 },
+  ];
+
+  await worker.setParameters(numberWorkerParams);
+
+  for (const region of regions) {
+    const variants = prepareCollectorRegionVariants(source, region);
+
+    for (const variant of variants) {
+      const { data } = await worker.recognize(
+        variant.canvas,
+        { rotateAuto: false },
+        { text: true },
+      );
+      const extracted = extractCollectorNumber(data.text);
+
+      if (!extracted) {
+        continue;
+      }
+
+      const confidence = Number(data.confidence.toFixed(1));
+      const previous = candidates.get(extracted);
+
+      if (!previous || confidence > previous.confidence) {
+        candidates.set(extracted, {
+          confidence,
+          source: `${region.label} / ${variant.label}`,
+          value: extracted,
+        });
+      }
+    }
+  }
+
+  return [...candidates.values()].sort((left, right) => {
+    if (right.confidence !== left.confidence) {
+      return right.confidence - left.confidence;
+    }
+
+    return right.value.length - left.value.length;
+  });
 }
 
 function prepareEnhancedCanvas(source: HTMLCanvasElement): PreparedCanvas {
@@ -279,10 +390,7 @@ function prepareEnhancedCanvas(source: HTMLCanvasElement): PreparedCanvas {
 
   for (let index = 0; index < data.length; index += 4) {
     const luma = getLuma(data[index], data[index + 1], data[index + 2]);
-    const normalized = Math.min(
-      1,
-      Math.max(0, (luma - minLuma) / range),
-    );
+    const normalized = Math.min(1, Math.max(0, (luma - minLuma) / range));
     const contrasted = Math.pow(normalized, 0.82);
     const boosted = Math.round(contrasted * 255);
 
@@ -304,6 +412,96 @@ function prepareColorFallbackCanvas(source: HTMLCanvasElement): PreparedCanvas {
     canvas: scaleCanvas(source, 1.6, 1800),
     label: 'crop couleur',
   };
+}
+
+function prepareCollectorRegionVariants(
+  source: HTMLCanvasElement,
+  region: CollectorRegion,
+): PreparedCanvas[] {
+  const cropped = cropCanvas(source, region);
+
+  return [
+    {
+      canvas: prepareNumberCanvas(cropped, false),
+      label: 'gris contraste',
+    },
+    {
+      canvas: prepareNumberCanvas(cropped, true),
+      label: 'binaire fort',
+    },
+  ];
+}
+
+function cropCanvas(
+  source: HTMLCanvasElement,
+  region: CollectorRegion,
+): HTMLCanvasElement {
+  const canvas = document.createElement('canvas');
+  const context = canvas.getContext('2d');
+  const left = Math.round(source.width * region.left);
+  const top = Math.round(source.height * region.top);
+  const width = Math.max(1, Math.round(source.width * region.width));
+  const height = Math.max(1, Math.round(source.height * region.height));
+
+  canvas.width = width;
+  canvas.height = height;
+
+  if (!context) {
+    return source;
+  }
+
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = 'high';
+  context.drawImage(source, left, top, width, height, 0, 0, width, height);
+
+  return canvas;
+}
+
+function prepareNumberCanvas(
+  source: HTMLCanvasElement,
+  useThreshold: boolean,
+): HTMLCanvasElement {
+  const scaled = scaleCanvas(source, 3.2, 2200);
+  const context = scaled.getContext('2d');
+
+  if (!context) {
+    return scaled;
+  }
+
+  const image = context.getImageData(0, 0, scaled.width, scaled.height);
+  const data = image.data;
+  let minLuma = 255;
+  let maxLuma = 0;
+
+  for (let index = 0; index < data.length; index += 4) {
+    const luma = getLuma(data[index], data[index + 1], data[index + 2]);
+
+    minLuma = Math.min(minLuma, luma);
+    maxLuma = Math.max(maxLuma, luma);
+  }
+
+  const range = Math.max(24, maxLuma - minLuma);
+  const threshold = minLuma + range * 0.58;
+
+  for (let index = 0; index < data.length; index += 4) {
+    const luma = getLuma(data[index], data[index + 1], data[index + 2]);
+    const normalized = Math.min(1, Math.max(0, (luma - minLuma) / range));
+    const contrasted = Math.pow(normalized, 0.72);
+    const boosted = Math.round(contrasted * 255);
+    const nextValue = useThreshold
+      ? boosted >= threshold
+        ? 255
+        : 0
+      : boosted;
+
+    data[index] = nextValue;
+    data[index + 1] = nextValue;
+    data[index + 2] = nextValue;
+  }
+
+  context.putImageData(image, 0, 0);
+
+  return scaled;
 }
 
 function scaleCanvas(
@@ -330,6 +528,30 @@ function scaleCanvas(
   context.drawImage(source, 0, 0, width, height);
 
   return canvas;
+}
+
+function extractCollectorNumber(rawValue: string): string {
+  const normalized = rawValue
+    .toUpperCase()
+    .replace(/\s+/g, '')
+    .replace(/[,;:]/g, '')
+    .replace(/[|]/g, '1')
+    .replace(/[()]/g, '');
+  const slashMatch = normalized.match(
+    /(?:[A-Z]{1,5}-?)?\d{1,3}\/[A-Z0-9]{1,4}/,
+  );
+
+  if (slashMatch) {
+    return slashMatch[0];
+  }
+
+  const promoMatch = normalized.match(/[A-Z]{2,6}-?\d{1,4}/);
+
+  if (promoMatch) {
+    return promoMatch[0];
+  }
+
+  return '';
 }
 
 function getLuma(red: number, green: number, blue: number): number {
