@@ -31,6 +31,8 @@ Le projet publie les assets avec la base `/open_scan_pokemon/` pour GitHub Pages
 - choix de la camera
 - preference pour la camera arriere sur mobile
 - memorisation du dernier capteur choisi
+- lecture OCR du cadre courant avec Tesseract.js
+- affichage du texte brut, des lignes detectees et des mots reconnus
 - etats clairs pour permission, indisponibilite et erreur
 
-Ce lot ne couvre pas encore la detection de carte, l OCR, la capture d image ni le pricing.
+Ce lot ne couvre pas encore la detection de carte, l identification fiable, le pricing ni le cadrage automatique.

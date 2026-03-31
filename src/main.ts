@@ -13,12 +13,27 @@ import {
   stopMediaStream,
   storePreferredCameraId,
 } from './camera';
+import {
+  type OcrResultSummary,
+  type OcrStatus,
+  recognizeCanvas,
+  setOcrProgressListener,
+  terminateOcrWorker,
+  warmupOcr,
+} from './ocr';
 
 type AppState = {
   activeDeviceId: string;
   currentStream: MediaStream | null;
   devices: CameraDevice[];
+  hasAttemptedOcrWarmup: boolean;
   isBusy: boolean;
+  lastOcrResult: OcrResultSummary | null;
+  ocrBusy: boolean;
+  ocrMessage: string;
+  ocrProgress: number;
+  ocrSnapshotUrl: string;
+  ocrStatus: OcrStatus;
   status: CameraStatus;
 };
 
@@ -42,6 +57,15 @@ const defaultMessages: Record<CameraStatus, string> = {
     'Aucune camera exploitable n a ete detectee ou le contexte n est pas securise.',
 };
 
+const ocrStatusLabels: Record<OcrStatus, string> = {
+  done: 'Lecture faite',
+  error: 'OCR en erreur',
+  idle: 'OCR en veille',
+  loading: 'Modele OCR',
+  ready: 'OCR pret',
+  scanning: 'Lecture OCR',
+};
+
 document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
   <div class="app-shell">
     <div class="ambient ambient-left" aria-hidden="true"></div>
@@ -50,11 +74,11 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
     <header class="hero-card">
       <p class="eyebrow">open source / scan web / beta camera</p>
       <div class="hero-copy">
-        <p class="kicker">Apercu live</p>
-        <h1>Cadre ta carte Pokemon et choisis la bonne camera.</h1>
+        <p class="kicker">Lecture OCR</p>
+        <h1>Cadre une carte et inspecte tout le texte que la camera comprend.</h1>
         <p class="intro">
-          Ce premier ecran pose la base du scan mobile-first: un flux video,
-          un selecteur de camera et des retours clairs sur les permissions.
+          Ce lot ajoute une analyse OCR du cadre courant pour verifier ce qui est
+          bien lu avant d identifier la carte de facon fiable.
         </p>
       </div>
     </header>
@@ -86,14 +110,14 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
             <span class="frame-corner corner-top-right"></span>
             <span class="frame-corner corner-bottom-left"></span>
             <span class="frame-corner corner-bottom-right"></span>
-            <div class="frame-copy">Centre la carte dans le cadre</div>
+            <div class="frame-copy">Centre la carte dans le cadre puis lance la lecture</div>
           </div>
         </div>
       </section>
 
       <aside class="control-panel">
         <p class="panel-label">Pilotage</p>
-        <h2>Selection de la camera</h2>
+        <h2>Camera et OCR</h2>
         <p id="camera-message" class="status-message">
           Preparation du flux video.
         </p>
@@ -107,19 +131,83 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
           </div>
         </label>
 
-        <button id="camera-refresh" class="action-button" type="button">
-          Activer la camera
-        </button>
+        <div class="button-stack">
+          <button id="camera-refresh" class="action-button" type="button">
+            Activer la camera
+          </button>
+          <button id="ocr-scan" class="secondary-button" type="button">
+            Lire le texte du cadre
+          </button>
+        </div>
 
         <section class="tips" aria-label="Infos de fonctionnement">
           <p class="tips-title">Notes utiles</p>
           <ul>
-            <li>Sur mobile, la camera arriere est preferee quand elle existe.</li>
-            <li>Le dernier capteur choisi est memorise sur cet appareil.</li>
-            <li>GitHub Pages servira le site en HTTPS pour autoriser la camera.</li>
+            <li>La premiere lecture OCR telecharge le modele de langue puis le met en cache.</li>
+            <li>Cette etape lit tout le texte du cadre, pas seulement les infos utiles.</li>
+            <li>Une photo nette et bien cadree fera une enorme difference sur la suite.</li>
           </ul>
         </section>
       </aside>
+
+      <section class="results-panel">
+        <div class="results-head">
+          <div>
+            <p class="panel-label">Diagnostic OCR</p>
+            <h2>Texte detecte dans le cadre</h2>
+          </div>
+          <span id="ocr-state" class="status-pill ocr-pill" data-ocr-status="idle">OCR en veille</span>
+        </div>
+
+        <p id="ocr-message" class="status-message">
+          Charge le modele OCR puis analyse le cadre pour afficher toutes les lignes detectees.
+        </p>
+
+        <div class="progress-shell" aria-hidden="true">
+          <div id="ocr-progress-bar" class="progress-bar" style="width: 0%"></div>
+        </div>
+
+        <div class="ocr-grid">
+          <section class="snapshot-card">
+            <p class="panel-label">Capture analysee</p>
+            <img id="ocr-snapshot" class="snapshot-image" alt="Capture OCR la plus recente" />
+            <div id="ocr-snapshot-empty" class="snapshot-empty">
+              La capture analysee apparaitra ici apres une lecture OCR.
+            </div>
+          </section>
+
+          <section class="results-card">
+            <div class="results-block">
+              <div class="results-subhead">
+                <p class="panel-label">Signaux reperes</p>
+                <span id="ocr-confidence" class="confidence-badge">Confiance 0%</span>
+              </div>
+              <ul id="ocr-signals" class="signal-list">
+                <li class="empty-item">Aucune information OCR pour le moment.</li>
+              </ul>
+            </div>
+
+            <div class="results-block">
+              <p class="panel-label">Texte brut</p>
+              <pre id="ocr-raw-text" class="raw-text">Aucune lecture lancee.</pre>
+            </div>
+
+            <div class="results-block">
+              <p class="panel-label">Lignes detectees</p>
+              <ul id="ocr-lines" class="result-list">
+                <li class="empty-item">Les lignes OCR apparaitront ici.</li>
+              </ul>
+            </div>
+
+            <div class="results-block">
+              <p class="panel-label">Mots reconnus</p>
+              <div id="ocr-words" class="word-cloud">
+                <span class="empty-item chip-empty">Les mots OCR apparaitront ici.</span>
+              </div>
+            </div>
+          </section>
+        </div>
+      </section>
     </main>
   </div>
 `;
@@ -130,14 +218,39 @@ const cameraState = getRequiredElement<HTMLSpanElement>('#camera-state');
 const cameraMessage = getRequiredElement<HTMLParagraphElement>('#camera-message');
 const cameraSelect = getRequiredElement<HTMLSelectElement>('#camera-select');
 const cameraRefresh = getRequiredElement<HTMLButtonElement>('#camera-refresh');
+const ocrScanButton = getRequiredElement<HTMLButtonElement>('#ocr-scan');
+const ocrStateLabel = getRequiredElement<HTMLSpanElement>('#ocr-state');
+const ocrMessage = getRequiredElement<HTMLParagraphElement>('#ocr-message');
+const ocrProgressBar = getRequiredElement<HTMLDivElement>('#ocr-progress-bar');
+const ocrSnapshot = getRequiredElement<HTMLImageElement>('#ocr-snapshot');
+const ocrSnapshotEmpty = getRequiredElement<HTMLDivElement>('#ocr-snapshot-empty');
+const ocrConfidence = getRequiredElement<HTMLSpanElement>('#ocr-confidence');
+const ocrSignals = getRequiredElement<HTMLUListElement>('#ocr-signals');
+const ocrRawText = getRequiredElement<HTMLElement>('#ocr-raw-text');
+const ocrLines = getRequiredElement<HTMLUListElement>('#ocr-lines');
+const ocrWords = getRequiredElement<HTMLDivElement>('#ocr-words');
 
 const state: AppState = {
   activeDeviceId: '',
   currentStream: null,
   devices: [],
+  hasAttemptedOcrWarmup: false,
   isBusy: false,
+  lastOcrResult: null,
+  ocrBusy: false,
+  ocrMessage:
+    'Charge le modele OCR puis analyse le cadre pour afficher toutes les lignes detectees.',
+  ocrProgress: 0,
+  ocrSnapshotUrl: '',
+  ocrStatus: 'idle',
   status: 'idle',
 };
+
+setOcrProgressListener((message) => {
+  state.ocrProgress = Math.max(0, Math.min(100, Math.round(message.progress * 100)));
+  state.ocrMessage = translateOcrProgress(message.status);
+  renderOcrState();
+});
 
 function getRequiredElement<T extends Element>(selector: string): T {
   const element = document.querySelector<T>(selector);
@@ -164,11 +277,15 @@ function setStreamPresence(hasStream: boolean): void {
 function syncControls(): void {
   cameraRefresh.disabled = state.isBusy;
   cameraSelect.disabled = state.isBusy || state.devices.length === 0;
+  ocrScanButton.disabled = state.ocrBusy || state.status !== 'ready';
   cameraRefresh.textContent = state.isBusy
     ? 'Ouverture en cours...'
     : state.status === 'ready'
       ? 'Relancer la camera'
       : 'Activer la camera';
+  ocrScanButton.textContent = state.ocrBusy
+    ? 'Lecture OCR en cours...'
+    : 'Lire le texte du cadre';
 }
 
 function renderCameraOptions(
@@ -196,6 +313,92 @@ function renderCameraOptions(
     cameraSelect.value = devices[0].deviceId;
     state.activeDeviceId = devices[0].deviceId;
   }
+}
+
+function renderOcrState(): void {
+  ocrStateLabel.dataset.ocrStatus = state.ocrStatus;
+  ocrStateLabel.textContent = ocrStatusLabels[state.ocrStatus];
+  ocrMessage.textContent = state.ocrMessage;
+  ocrProgressBar.style.width = `${state.ocrProgress}%`;
+
+  if (state.ocrSnapshotUrl) {
+    ocrSnapshot.src = state.ocrSnapshotUrl;
+    ocrSnapshot.hidden = false;
+    ocrSnapshotEmpty.hidden = true;
+  } else {
+    ocrSnapshot.removeAttribute('src');
+    ocrSnapshot.hidden = true;
+    ocrSnapshotEmpty.hidden = false;
+  }
+
+  const result = state.lastOcrResult;
+
+  if (!result) {
+    ocrConfidence.textContent = 'Confiance 0%';
+    ocrSignals.innerHTML =
+      '<li class="empty-item">Aucune information OCR pour le moment.</li>';
+    ocrRawText.textContent = 'Aucune lecture lancee.';
+    ocrLines.innerHTML =
+      '<li class="empty-item">Les lignes OCR apparaitront ici.</li>';
+    ocrWords.innerHTML =
+      '<span class="empty-item chip-empty">Les mots OCR apparaitront ici.</span>';
+    syncControls();
+    return;
+  }
+
+  ocrConfidence.textContent = `Confiance ${Math.round(result.averageConfidence)}%`;
+  ocrSignals.innerHTML =
+    result.signals.length > 0
+      ? result.signals
+          .map(
+            (signal) => `
+              <li class="signal-item">
+                <span class="signal-label">${escapeHtml(signal.label)}</span>
+                <strong>${escapeHtml(signal.value)}</strong>
+                <span class="signal-meta">${Math.round(signal.confidence)}%</span>
+              </li>
+            `,
+          )
+          .join('')
+      : '<li class="empty-item">Aucun signal clair n a ete repere dans cette lecture.</li>';
+  ocrRawText.textContent = result.rawText || 'Aucun texte brut n a ete remonte.';
+  ocrLines.innerHTML =
+    result.lines.length > 0
+      ? result.lines
+          .map(
+            (line) => `
+              <li class="result-item">
+                <span class="result-text">${escapeHtml(line.text)}</span>
+                <span class="result-confidence">${Math.round(line.confidence)}%</span>
+              </li>
+            `,
+          )
+          .join('')
+      : '<li class="empty-item">Aucune ligne OCR exploitable.</li>';
+  ocrWords.innerHTML =
+    result.words.length > 0
+      ? result.words
+          .map(
+            (word) => `
+              <span class="word-chip" title="Confiance ${Math.round(word.confidence)}%">
+                ${escapeHtml(word.text)}
+              </span>
+            `,
+          )
+          .join('')
+      : '<span class="empty-item chip-empty">Aucun mot OCR exploitable.</span>';
+  syncControls();
+}
+
+function setOcrStatus(status: OcrStatus, message: string, progress?: number): void {
+  state.ocrStatus = status;
+  state.ocrMessage = message;
+
+  if (typeof progress === 'number') {
+    state.ocrProgress = progress;
+  }
+
+  renderOcrState();
 }
 
 function resolveActiveDeviceId(
@@ -256,6 +459,35 @@ function watchTrackEnd(stream: MediaStream): void {
   });
 }
 
+async function maybeWarmupOcr(): Promise<void> {
+  if (state.hasAttemptedOcrWarmup) {
+    return;
+  }
+
+  state.hasAttemptedOcrWarmup = true;
+  setOcrStatus(
+    'loading',
+    'Chargement du modele OCR en tache de fond. La premiere lecture peut prendre un peu de temps.',
+    0,
+  );
+
+  try {
+    await warmupOcr();
+    setOcrStatus(
+      'ready',
+      'Modele OCR pret. Lance une lecture du cadre pour afficher tout le texte detecte.',
+      100,
+    );
+  } catch {
+    state.hasAttemptedOcrWarmup = false;
+    setOcrStatus(
+      'error',
+      'Le modele OCR n a pas pu etre charge. Verifie le reseau puis reessaie.',
+      0,
+    );
+  }
+}
+
 async function startCamera(requestedDeviceId?: string): Promise<void> {
   if (!cameraApisAvailable() || !cameraContextAllowed()) {
     stopMediaStream(state.currentStream);
@@ -292,6 +524,7 @@ async function startCamera(requestedDeviceId?: string): Promise<void> {
     setStreamPresence(true);
     setStatus('ready');
     watchTrackEnd(stream);
+    void maybeWarmupOcr();
   } catch (error) {
     const devices = await safeListDevices();
     const fallbackDeviceId =
@@ -320,6 +553,135 @@ async function refreshDeviceList(): Promise<void> {
   syncControls();
 }
 
+async function scanCurrentFrame(): Promise<void> {
+  if (state.status !== 'ready' || !state.currentStream) {
+    setOcrStatus(
+      'error',
+      'La camera doit etre active avant de lancer une lecture OCR.',
+      0,
+    );
+    return;
+  }
+
+  if (videoElement.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+    setOcrStatus(
+      'error',
+      'Le flux video n est pas encore pret. Attends une seconde puis relance la lecture.',
+      0,
+    );
+    return;
+  }
+
+  const canvas = captureVideoFrame(videoElement);
+
+  if (!canvas) {
+    setOcrStatus(
+      'error',
+      'Impossible de capturer une image du flux video pour l OCR.',
+      0,
+    );
+    return;
+  }
+
+  state.ocrBusy = true;
+  state.ocrProgress = 0;
+  setOcrStatus(
+    state.hasAttemptedOcrWarmup ? 'scanning' : 'loading',
+    'Preparation de la capture OCR.',
+    0,
+  );
+
+  try {
+    await maybeWarmupOcr();
+    state.ocrStatus = 'scanning';
+    state.ocrMessage =
+      'Lecture du texte en cours. La premiere carte peut prendre plus de temps.';
+    state.ocrProgress = 0;
+    renderOcrState();
+
+    const snapshotUrl = canvas.toDataURL('image/jpeg', 0.92);
+    const result = await recognizeCanvas(canvas);
+
+    state.lastOcrResult = result;
+    state.ocrSnapshotUrl = snapshotUrl;
+    state.ocrProgress = 100;
+    setOcrStatus(
+      'done',
+      result.rawText
+        ? `Lecture terminee: ${result.lines.length} ligne(s) et ${result.words.length} mot(s) detectes.`
+        : 'Lecture terminee mais aucun texte exploitable n a ete remonte.',
+      100,
+    );
+  } catch (error) {
+    const message =
+      error instanceof Error
+        ? `OCR indisponible: ${error.message}`
+        : 'OCR indisponible pour le moment.';
+
+    setOcrStatus('error', message, 0);
+  } finally {
+    state.ocrBusy = false;
+    syncControls();
+  }
+}
+
+function captureVideoFrame(video: HTMLVideoElement): HTMLCanvasElement | null {
+  const width = video.videoWidth;
+  const height = video.videoHeight;
+
+  if (!width || !height) {
+    return null;
+  }
+
+  const longestEdge = Math.max(width, height);
+  const scale = longestEdge > 1600 ? 1600 / longestEdge : 1;
+  const targetWidth = Math.max(1, Math.round(width * scale));
+  const targetHeight = Math.max(1, Math.round(height * scale));
+  const canvas = document.createElement('canvas');
+  const context = canvas.getContext('2d');
+
+  if (!context) {
+    return null;
+  }
+
+  canvas.width = targetWidth;
+  canvas.height = targetHeight;
+  context.drawImage(video, 0, 0, targetWidth, targetHeight);
+
+  return canvas;
+}
+
+function translateOcrProgress(status: string): string {
+  const normalized = status.toLowerCase();
+
+  if (normalized.includes('loading language')) {
+    return 'Chargement des modeles de langue OCR.';
+  }
+
+  if (normalized.includes('loading tesseract core')) {
+    return 'Chargement du coeur OCR dans le navigateur.';
+  }
+
+  if (normalized.includes('initializing')) {
+    return 'Initialisation du moteur OCR.';
+  }
+
+  if (normalized.includes('recognizing text')) {
+    return 'Lecture du texte de la carte en cours.';
+  }
+
+  return `OCR: ${status}`;
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
 cameraSelect.addEventListener('change', () => {
   const nextDeviceId = cameraSelect.value;
 
@@ -335,6 +697,10 @@ cameraRefresh.addEventListener('click', () => {
   void startCamera(nextDeviceId);
 });
 
+ocrScanButton.addEventListener('click', () => {
+  void scanCurrentFrame();
+});
+
 if (cameraApisAvailable()) {
   navigator.mediaDevices.addEventListener('devicechange', () => {
     void refreshDeviceList();
@@ -343,7 +709,9 @@ if (cameraApisAvailable()) {
 
 window.addEventListener('beforeunload', () => {
   stopMediaStream(state.currentStream);
+  void terminateOcrWorker();
 });
 
+renderOcrState();
 setStatus('idle');
 void startCamera();
